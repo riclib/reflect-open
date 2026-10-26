@@ -23,7 +23,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use file_id::{FileId, get_file_id};
-use notify::{RecommendedWatcher, RecursiveMode};
+use notify::event::{AccessKind, AccessMode};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, FileIdCache, new_debouncer_opt};
 use reflect_graph_paths::{
     GraphPathKind, classify, evicted_logical_path, eviction_placeholder, has_pruned_component,
@@ -133,6 +134,31 @@ impl FileIdCache for PrunedFileIdMap {
 struct BatchEffects {
     changes: Vec<FileChange>,
     reconcile: bool,
+}
+
+/// Whether an event can mean the tree changed. notify reports reads too
+/// (Linux inotify `OPEN` and `CLOSE_NOWRITE`), and a read of a visible
+/// directory would otherwise flip `reconcile` in `collect_changes`: the
+/// reconcile pass lists every directory, those reads come back as events, and
+/// the pass runs again, about twice a second for as long as the app is open.
+/// A finished write (`CLOSE_WRITE`) still counts.
+fn changes_something(kind: &EventKind) -> bool {
+    !matches!(
+        kind,
+        EventKind::Access(
+            AccessKind::Open(_) | AccessKind::Read | AccessKind::Close(AccessMode::Read)
+        )
+    )
+}
+
+/// The paths a debounced batch may have changed: every event's paths except
+/// those of reads (`changes_something`).
+fn changed_paths(events: &[notify_debouncer_full::DebouncedEvent]) -> Vec<PathBuf> {
+    events
+        .iter()
+        .filter(|event| changes_something(&event.kind))
+        .flat_map(|event| event.paths.clone())
+        .collect()
 }
 
 /// Graph-relative wire path if `path` is tracked: an eligible markdown note
@@ -295,10 +321,7 @@ pub fn watch_start(
                 return; // watch errors are transient; the next batch recovers
             };
             let rescan_demanded = events.iter().any(|event| event.need_rescan());
-            let paths: Vec<PathBuf> = events
-                .iter()
-                .flat_map(|event| event.paths.clone())
-                .collect();
+            let paths = changed_paths(&events);
             let mut effects = collect_changes(&paths, &handler_root);
             effects.reconcile |= rescan_demanded;
             if effects.reconcile || !effects.changes.is_empty() {
@@ -529,6 +552,46 @@ mod tests {
             ],
             root,
         );
+        assert_eq!(effects, BatchEffects::default());
+    }
+
+    #[test]
+    fn reads_are_not_changes_but_writes_are() {
+        use notify::event::{CreateKind, ModifyKind, RemoveKind};
+        // The reconcile pass's own directory listing comes back as these.
+        assert!(!changes_something(&EventKind::Access(AccessKind::Open(
+            AccessMode::Any
+        ))));
+        assert!(!changes_something(&EventKind::Access(AccessKind::Close(
+            AccessMode::Read
+        ))));
+        assert!(!changes_something(&EventKind::Access(AccessKind::Read)));
+        // A finished write and every structural kind still reach collect_changes.
+        assert!(changes_something(&EventKind::Access(AccessKind::Close(
+            AccessMode::Write
+        ))));
+        assert!(changes_something(&EventKind::Create(CreateKind::Folder)));
+        assert!(changes_something(&EventKind::Remove(RemoveKind::Folder)));
+        assert!(changes_something(&EventKind::Modify(ModifyKind::Any)));
+    }
+
+    #[test]
+    fn a_listing_of_a_visible_directory_demands_no_reconcile() {
+        use notify_debouncer_full::DebouncedEvent;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        let read = |kind| {
+            DebouncedEvent::new(
+                notify::Event::new(EventKind::Access(kind)).add_path(root.join("notes")),
+                std::time::Instant::now(),
+            )
+        };
+        let listing = [
+            read(AccessKind::Open(AccessMode::Any)),
+            read(AccessKind::Close(AccessMode::Read)),
+        ];
+        let effects = collect_changes(&changed_paths(&listing), root);
         assert_eq!(effects, BatchEffects::default());
     }
 

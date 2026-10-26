@@ -37,9 +37,27 @@ use crate::fs::GraphState;
 use reflect_types::events::{INDEX_CHANGED, INDEX_RECONCILE};
 use reflect_types::{ChangeKind, FileChange};
 
-/// Holds the active debouncer; dropping it stops the background watch thread.
+/// Holds the active debouncer and the root it watches; dropping it asks the
+/// background watch thread to stop.
 #[derive(Default)]
-pub struct WatcherState(pub Mutex<Option<Debouncer<RecommendedWatcher, PrunedFileIdMap>>>);
+pub struct WatcherState(pub Mutex<Option<ActiveWatcher>>);
+
+/// The installed watcher and the graph root it was installed for.
+///
+/// The root is kept so `watch_start` can tell a restart for the graph that is
+/// already watched (every reconcile pass ends with one) from a graph switch,
+/// and keep the running watcher in the first case. Replacing it is not free on
+/// Linux: dropping notify's inotify watcher only *sends* its event loop a
+/// shutdown message, and the loop drains the inotify queue before it reads
+/// messages, so while the tree is busy (the index pass writing `.reflect/`)
+/// the old loop keeps running, keeps its inotify fd and keeps feeding events
+/// into a debouncer whose own thread has already stopped and will never drain
+/// them. One replacement per pass made that a leak of a thread, an fd and an
+/// unbounded event buffer per pass.
+pub struct ActiveWatcher {
+    root: PathBuf,
+    _debouncer: Debouncer<RecommendedWatcher, PrunedFileIdMap>,
+}
 
 /// The debouncer's file-ID cache, pruned to the trees that can carry tracked
 /// files.
@@ -253,11 +271,16 @@ fn collect_changes(paths: &[PathBuf], root: &Path) -> BatchEffects {
 
 fn lock_watcher<'a>(
     watcher: &'a State<WatcherState>,
-) -> AppResult<std::sync::MutexGuard<'a, Option<Debouncer<RecommendedWatcher, PrunedFileIdMap>>>> {
+) -> AppResult<std::sync::MutexGuard<'a, Option<ActiveWatcher>>> {
     watcher.0.lock().map_err(|err| {
         tracing::error!(?err, "watcher state lock poisoned by an earlier panic");
         AppError::io("watcher state lock poisoned")
     })
+}
+
+/// Whether the installed watcher (if any) already watches `root`.
+fn watches_root(active: Option<&ActiveWatcher>, root: &Path) -> bool {
+    active.is_some_and(|current| current.root == root)
 }
 
 /// Start (or restart) watching the active graph; emits `index:changed`
@@ -280,10 +303,20 @@ pub fn watch_start(
     })?;
     let root = graph_guard.root.clone().ok_or_else(AppError::no_graph)?;
 
-    // Drop any previous watcher first: if installing the new one fails we're then
-    // left with no watcher, rather than the previous graph's still driving
-    // index:changed against the now-current graph.
-    *lock_watcher(&watcher)? = None;
+    {
+        let mut active = lock_watcher(&watcher)?;
+        // Already watching this graph: keep the running watcher. It follows
+        // new directories itself, so a restart would buy nothing but the
+        // replacement cost `ActiveWatcher` describes.
+        if watches_root(active.as_ref(), &root) {
+            tracing::debug!("watch_start kept the running watcher");
+            return Ok(());
+        }
+        // Drop any previous watcher first: if installing the new one fails
+        // we're then left with no watcher, rather than the previous graph's
+        // still driving index:changed against the now-current graph.
+        *active = None;
+    }
 
     let started = std::time::Instant::now();
     let handler_root = root.clone();
@@ -322,8 +355,10 @@ pub fn watch_start(
         .watch(&root, RecursiveMode::Recursive)
         .map_err(|err| AppError::io(err.to_string()))?;
 
-    // Dropping any previous debouncer here stops its thread.
-    *lock_watcher(&watcher)? = Some(debouncer);
+    *lock_watcher(&watcher)? = Some(ActiveWatcher {
+        root,
+        _debouncer: debouncer,
+    });
     drop(graph_guard);
     tracing::info!(
         elapsed_ms = started.elapsed().as_millis() as u64,
@@ -342,6 +377,31 @@ pub fn watch_stop(watcher: State<WatcherState>) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn active_watcher(root: &Path) -> ActiveWatcher {
+        let debouncer = new_debouncer_opt::<_, RecommendedWatcher, PrunedFileIdMap>(
+            Duration::from_millis(400),
+            None,
+            |_: DebounceEventResult| {},
+            PrunedFileIdMap::new(root.to_path_buf()),
+            notify::Config::default(),
+        )
+        .unwrap();
+        ActiveWatcher {
+            root: root.to_path_buf(),
+            _debouncer: debouncer,
+        }
+    }
+
+    #[test]
+    fn a_restart_for_the_watched_graph_keeps_the_running_watcher() {
+        let graph = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let active = active_watcher(graph.path());
+        assert!(watches_root(Some(&active), graph.path()));
+        assert!(!watches_root(Some(&active), other.path()));
+        assert!(!watches_root(None, graph.path()));
+    }
 
     #[test]
     fn tracks_eligible_markdown_anywhere_and_recordings() {

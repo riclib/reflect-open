@@ -56,8 +56,14 @@ pub struct WatcherState(pub Mutex<Option<ActiveWatcher>>);
 /// unbounded event buffer per pass.
 pub struct ActiveWatcher {
     root: PathBuf,
+    /// The root directory's identity when the watch was installed: a graph
+    /// folder replaced at the same path (moved away and recreated) leaves the
+    /// old watch on a directory that is no longer the graph.
+    root_id: Option<FileId>,
     _debouncer: Debouncer<RecommendedWatcher, PrunedFileIdMap>,
 }
+
+type GraphDebouncer = Debouncer<RecommendedWatcher, PrunedFileIdMap>;
 
 /// The debouncer's file-ID cache, pruned to the trees that can carry tracked
 /// files.
@@ -278,9 +284,32 @@ fn lock_watcher<'a>(
     })
 }
 
-/// Whether the installed watcher (if any) already watches `root`.
-fn watches_root(active: Option<&ActiveWatcher>, root: &Path) -> bool {
-    active.is_some_and(|current| current.root == root)
+/// Keep the installed watcher when it watches `root` and `root` is still the
+/// directory it was installed on; otherwise drop it and install the one
+/// `install` builds. Returns whether it installed.
+///
+/// The previous watcher is dropped before `install` runs: if installing fails
+/// we're then left with no watcher, rather than the previous graph's still
+/// driving index:changed against the now-current graph.
+fn keep_or_install(
+    slot: &mut Option<ActiveWatcher>,
+    root: &Path,
+    install: impl FnOnce() -> AppResult<GraphDebouncer>,
+) -> AppResult<bool> {
+    let root_id = get_file_id(root).ok();
+    let still_watching = slot.as_ref().is_some_and(|current| {
+        current.root == root && current.root_id.is_some() && current.root_id == root_id
+    });
+    if still_watching {
+        return Ok(false);
+    }
+    *slot = None;
+    *slot = Some(ActiveWatcher {
+        root: root.to_path_buf(),
+        root_id,
+        _debouncer: install()?,
+    });
+    Ok(true)
 }
 
 /// Start (or restart) watching the active graph; emits `index:changed`
@@ -303,67 +332,57 @@ pub fn watch_start(
     })?;
     let root = graph_guard.root.clone().ok_or_else(AppError::no_graph)?;
 
-    {
-        let mut active = lock_watcher(&watcher)?;
-        // Already watching this graph: keep the running watcher. It follows
-        // new directories itself, so a restart would buy nothing but the
-        // replacement cost `ActiveWatcher` describes.
-        if watches_root(active.as_ref(), &root) {
-            tracing::debug!("watch_start kept the running watcher");
-            return Ok(());
-        }
-        // Drop any previous watcher first: if installing the new one fails
-        // we're then left with no watcher, rather than the previous graph's
-        // still driving index:changed against the now-current graph.
-        *active = None;
-    }
-
     let started = std::time::Instant::now();
-    let handler_root = root.clone();
-    let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, PrunedFileIdMap>(
-        Duration::from_millis(400),
-        None,
-        move |result: DebounceEventResult| {
-            let Ok(events) = result else {
-                return; // watch errors are transient; the next batch recovers
-            };
-            let rescan_demanded = events.iter().any(|event| event.need_rescan());
-            let paths: Vec<PathBuf> = events
-                .iter()
-                .flat_map(|event| event.paths.clone())
-                .collect();
-            let mut effects = collect_changes(&paths, &handler_root);
-            effects.reconcile |= rescan_demanded;
-            if effects.reconcile || !effects.changes.is_empty() {
-                // Drop the cached catalog before telling the frontend: its
-                // follow-up `list_files` must re-walk, not replay the cache.
-                crate::fs::invalidate_file_catalog(&app.state::<GraphState>(), &handler_root);
-            }
-            if !effects.changes.is_empty() {
-                let _ = app.emit(INDEX_CHANGED, &effects.changes);
-            }
-            if effects.reconcile {
-                let _ = app.emit(INDEX_RECONCILE, ());
-            }
-        },
-        PrunedFileIdMap::new(root.clone()),
-        notify::Config::default(),
-    )
-    .map_err(|err| AppError::io(err.to_string()))?;
-
-    debouncer
-        .watch(&root, RecursiveMode::Recursive)
+    // Already watching this graph: keep the running watcher. It follows new
+    // directories itself, so a restart would buy nothing but the replacement
+    // cost `ActiveWatcher` describes.
+    let installed = keep_or_install(&mut *lock_watcher(&watcher)?, &root, || {
+        let handler_root = root.clone();
+        let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, PrunedFileIdMap>(
+            Duration::from_millis(400),
+            None,
+            move |result: DebounceEventResult| {
+                let Ok(events) = result else {
+                    return; // watch errors are transient; the next batch recovers
+                };
+                let rescan_demanded = events.iter().any(|event| event.need_rescan());
+                let paths: Vec<PathBuf> = events
+                    .iter()
+                    .flat_map(|event| event.paths.clone())
+                    .collect();
+                let mut effects = collect_changes(&paths, &handler_root);
+                effects.reconcile |= rescan_demanded;
+                if effects.reconcile || !effects.changes.is_empty() {
+                    // Drop the cached catalog before telling the frontend: its
+                    // follow-up `list_files` must re-walk, not replay the cache.
+                    crate::fs::invalidate_file_catalog(&app.state::<GraphState>(), &handler_root);
+                }
+                if !effects.changes.is_empty() {
+                    let _ = app.emit(INDEX_CHANGED, &effects.changes);
+                }
+                if effects.reconcile {
+                    let _ = app.emit(INDEX_RECONCILE, ());
+                }
+            },
+            PrunedFileIdMap::new(root.clone()),
+            notify::Config::default(),
+        )
         .map_err(|err| AppError::io(err.to_string()))?;
 
-    *lock_watcher(&watcher)? = Some(ActiveWatcher {
-        root,
-        _debouncer: debouncer,
-    });
+        debouncer
+            .watch(&root, RecursiveMode::Recursive)
+            .map_err(|err| AppError::io(err.to_string()))?;
+        Ok(debouncer)
+    })?;
     drop(graph_guard);
-    tracing::info!(
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "watch_start installed"
-    );
+    if installed {
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "watch_start installed"
+        );
+    } else {
+        tracing::debug!("watch_start kept the running watcher");
+    }
     Ok(())
 }
 
@@ -378,29 +397,55 @@ pub fn watch_stop(watcher: State<WatcherState>) -> AppResult<()> {
 mod tests {
     use super::*;
 
-    fn active_watcher(root: &Path) -> ActiveWatcher {
-        let debouncer = new_debouncer_opt::<_, RecommendedWatcher, PrunedFileIdMap>(
-            Duration::from_millis(400),
-            None,
-            |_: DebounceEventResult| {},
-            PrunedFileIdMap::new(root.to_path_buf()),
-            notify::Config::default(),
-        )
+    /// `keep_or_install` with a real, watching debouncer, counting installs.
+    fn install_counted(slot: &mut Option<ActiveWatcher>, root: &Path, installs: &mut usize) {
+        keep_or_install(slot, root, || {
+            *installs += 1;
+            let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, PrunedFileIdMap>(
+                Duration::from_millis(400),
+                None,
+                |_: DebounceEventResult| {},
+                PrunedFileIdMap::new(root.to_path_buf()),
+                notify::Config::default(),
+            )
+            .unwrap();
+            debouncer.watch(root, RecursiveMode::Recursive).unwrap();
+            Ok(debouncer)
+        })
         .unwrap();
-        ActiveWatcher {
-            root: root.to_path_buf(),
-            _debouncer: debouncer,
-        }
     }
 
     #[test]
     fn a_restart_for_the_watched_graph_keeps_the_running_watcher() {
         let graph = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
-        let active = active_watcher(graph.path());
-        assert!(watches_root(Some(&active), graph.path()));
-        assert!(!watches_root(Some(&active), other.path()));
-        assert!(!watches_root(None, graph.path()));
+        let mut slot = None;
+        let mut installs = 0;
+        install_counted(&mut slot, graph.path(), &mut installs);
+        // Every reconcile pass ends with a watch_start for the same graph.
+        install_counted(&mut slot, graph.path(), &mut installs);
+        install_counted(&mut slot, graph.path(), &mut installs);
+        assert_eq!(installs, 1);
+        // A graph switch replaces it.
+        install_counted(&mut slot, other.path(), &mut installs);
+        assert_eq!(installs, 2);
+        assert_eq!(slot.as_ref().unwrap().root, other.path());
+    }
+
+    #[test]
+    fn a_graph_folder_replaced_at_the_same_path_gets_a_new_watcher() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("graph");
+        std::fs::create_dir(&root).unwrap();
+        let mut slot = None;
+        let mut installs = 0;
+        install_counted(&mut slot, &root, &mut installs);
+        // Moved away (still existing, so its inode cannot be reused) and
+        // recreated: the installed watch is on the old directory.
+        std::fs::rename(&root, parent.path().join("graph.old")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        install_counted(&mut slot, &root, &mut installs);
+        assert_eq!(installs, 2);
     }
 
     #[test]

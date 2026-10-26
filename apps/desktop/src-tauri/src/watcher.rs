@@ -99,6 +99,15 @@ impl FileIdCache for PrunedFileIdMap {
     }
 
     fn add_path(&mut self, path: &Path, recursive_mode: RecursiveMode) {
+        // A path the cache never keeps must not be walked either. The debouncer
+        // calls this for every event on a path it finds no id for — and a
+        // hidden path never has one, by design. Walking it anyway opens the
+        // directory before `filter_entry` rejects it, and on Linux that open is
+        // itself an inotify event on the same path: `.git/info` opened
+        // ~75,000 times a second on the watcher's own thread, forever.
+        if !cache_keeps(&self.root, path) {
+            return;
+        }
         let depth = if recursive_mode == RecursiveMode::Recursive {
             usize::MAX
         } else {
@@ -637,6 +646,57 @@ mod tests {
         assert_eq!(effects.changes.len(), 1);
         assert_eq!(effects.changes[0].path, "notes/a.md");
         assert_eq!(effects.changes[0].kind, ChangeKind::Upsert);
+    }
+
+    /// The loop this guards: an inotify open event on a hidden directory made
+    /// the debouncer re-add it to the cache, whose walk opened it again —
+    /// counted where it happens, at the cache.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_open_of_a_hidden_directory_does_not_echo_forever() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counting(PrunedFileIdMap, Arc<AtomicUsize>);
+        impl FileIdCache for Counting {
+            fn cached_file_id(&self, path: &Path) -> Option<impl AsRef<FileId>> {
+                self.0.cached_file_id(path)
+            }
+            fn add_path(&mut self, path: &Path, recursive_mode: RecursiveMode) {
+                if path.components().any(|c| c.as_os_str() == ".git") {
+                    self.1.fetch_add(1, Ordering::Relaxed);
+                }
+                self.0.add_path(path, recursive_mode);
+            }
+            fn remove_path(&mut self, path: &Path) {
+                self.0.remove_path(path);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".git/info")).unwrap();
+        let adds = Arc::new(AtomicUsize::new(0));
+        let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, Counting>(
+            Duration::from_millis(100),
+            None,
+            |_: DebounceEventResult| {},
+            Counting(PrunedFileIdMap::new(root.clone()), adds.clone()),
+            notify::Config::default(),
+        )
+        .unwrap();
+        debouncer.watch(&root, RecursiveMode::Recursive).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let before = adds.load(Ordering::Relaxed);
+
+        drop(std::fs::read_dir(root.join(".git/info")).unwrap());
+        std::thread::sleep(Duration::from_millis(500));
+
+        let echoed = adds.load(Ordering::Relaxed) - before;
+        assert!(
+            echoed < 20,
+            "one open of .git/info made the cache add hidden paths {echoed} times: the walk reopens them"
+        );
     }
 
     #[test]
